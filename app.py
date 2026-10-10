@@ -176,6 +176,71 @@ def dashboard():
     # Yesterday closing is surfaced as closed yesterday here; opening/closing backlog is not inferred from this count.
     return jsonify(ok=True,metrics=metrics,errors=errors,notes=['Agent workload is based on the latest 2,000 cases returned by Salesforce.','Owner changes are a forwarding proxy; validate transfer rules and first-assigned-group attribution before using for official L1/L2 reporting.','Closed yesterday is not the same as yesterday end-of-day open backlog.'])
 
+
+@app.get('/diagnostics')
+@require_app_login
+def diagnostics():
+    """Compare Salesforce TODAY literals with explicit Asia/Kolkata boundaries.
+
+    This endpoint is diagnostic only; it does not change dashboard counts.
+    Salesforce report filters and report running-user context must still be
+    compared separately with the connected user and report definition.
+    """
+    if not current_sf():
+        return jsonify(ok=False, error='Connect Salesforce first.'), 401
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    sf = current_sf() or {}
+    now_ist = datetime.now(ZoneInfo('Asia/Kolkata'))
+    start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_ist = start_ist + timedelta(days=1)
+    start_utc = start_ist.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_utc = end_ist.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    checks = {
+        'created_today_literal': "SELECT COUNT() FROM Case WHERE CreatedDate = TODAY",
+        'created_yesterday_literal': "SELECT COUNT() FROM Case WHERE CreatedDate = YESTERDAY",
+        'created_explicit_ist_day': (
+            "SELECT COUNT() FROM Case WHERE CreatedDate >= " + start_utc +
+            " AND CreatedDate < " + end_utc
+        ),
+        'open_now': "SELECT COUNT() FROM Case WHERE IsClosed = FALSE",
+        'closed_today_literal': "SELECT COUNT() FROM Case WHERE IsClosed = TRUE AND ClosedDate = TODAY",
+    }
+    results = {}
+    for name, soql in checks.items():
+        try:
+            result = query(soql)
+            results[name] = {'count': result.get('totalSize'), 'soql': soql}
+        except Exception as exc:
+            results[name] = {'error': str(exc), 'soql': soql}
+
+    user_info = {}
+    user_id = sf.get('user_id')
+    if user_id:
+        try:
+            u = sf_request('GET', f'/services/data/v{API_VERSION}/sobjects/User/{user_id}')
+            for field in ('Id', 'Username', 'Name', 'TimeZoneSidKey', 'LocaleSidKey', 'LanguageLocaleKey', 'ProfileId', 'UserRoleId', 'IsActive'):
+                if field in u: user_info[field] = u[field]
+        except Exception as exc:
+            user_info = {'error': str(exc)}
+
+    return jsonify(
+        ok=True,
+        diagnostic_only=True,
+        connected_username=sf.get('username'),
+        organization_id=sf.get('org_id'),
+        server_today_context='Salesforce SOQL TODAY literal',
+        explicit_comparison_timezone='Asia/Kolkata',
+        explicit_start_utc=start_utc,
+        explicit_end_utc_exclusive=end_utc,
+        generated_at_ist=now_ist.isoformat(),
+        connected_user=user_info,
+        checks=results,
+        next_step='Compare these counts with the Salesforce report filters, date field, running user, and report time zone. Do not change official dashboard metrics until the report definition is matched.'
+    )
+
 @app.get('/objects')
 @require_app_login
 def objects():
