@@ -70,6 +70,27 @@ def describe(obj):
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', obj or ''): raise RuntimeError('Invalid Salesforce object name.')
     return sf_request('GET', f'/services/data/v{API_VERSION}/sobjects/{obj}/describe')
 
+def first_assigned_group_api_name():
+    """Resolve the Case field by label, or use an explicitly configured API name.
+
+    Set FIRST_ASSIGNED_GROUP_FIELD in Render if Salesforce describe returns an
+    ambiguous/no label match. This avoids guessing a custom field API name.
+    """
+    configured = os.environ.get('FIRST_ASSIGNED_GROUP_FIELD', '').strip()
+    if configured:
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', configured):
+            raise RuntimeError('FIRST_ASSIGNED_GROUP_FIELD is not a valid Salesforce API field name.')
+        return configured
+    fields = describe('Case').get('fields', [])
+    matches = [f.get('name') for f in fields
+               if (f.get('label') or '').strip().casefold() == 'first assigned group' and f.get('name')]
+    matches = list(dict.fromkeys(matches))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RuntimeError("Could not find a Case field labelled 'First Assigned Group'. Set FIRST_ASSIGNED_GROUP_FIELD in Render to its API name.")
+    raise RuntimeError("Multiple Case fields are labelled 'First Assigned Group'. Set FIRST_ASSIGNED_GROUP_FIELD in Render to the correct API name.")
+
 
 def require_app_login(fn):
     @wraps(fn)
@@ -149,7 +170,7 @@ def dashboard():
     if not current_sf(): return jsonify(ok=False,error='Connect Salesforce first.'),401
     # Keep counts as separate SOQL queries; SOQL does not support SQL CASE expressions in SUM.
     specs={
-      'inward_today':("SELECT COUNT() FROM Case WHERE CreatedDate = TODAY",'Cases created today'),
+      'inward_today':(None,'Cases created today — ERP Helpdesk L1/L2'),
       'resolved_today':("SELECT COUNT() FROM Case WHERE IsClosed = TRUE AND ClosedDate = TODAY",'Cases closed today'),
       'closed_yesterday':("SELECT COUNT() FROM Case WHERE IsClosed = TRUE AND ClosedDate = YESTERDAY",'Cases closed yesterday'),
       'open_now':("SELECT COUNT() FROM Case WHERE IsClosed = FALSE",'Open cases now'),
@@ -158,6 +179,11 @@ def dashboard():
     metrics={}; errors=[]
     for key,(soql,label) in specs.items():
         try:
+            if key == 'inward_today':
+                group_field = first_assigned_group_api_name()
+                # Match the two report filter values exactly; SOQL string values are escaped.
+                group_values = "'ERP Helpdesk-L1','ERP Helpdesk-L2'"
+                soql = f"SELECT COUNT() FROM Case WHERE CreatedDate = TODAY AND {group_field} IN ({group_values})"
             data=query(soql); metrics[key]={'label':label,'value':data.get('totalSize',0)}
         except Exception as e: metrics[key]={'label':label,'value':None,'error':str(e)}; errors.append(label+': '+str(e))
     # Agent load is calculated client-side from returned case records to avoid unsupported aggregate CASE logic.
@@ -174,7 +200,7 @@ def dashboard():
         metrics['recent_cases']={'records':[{k:v for k,v in c.items() if k!='attributes'} for c in records[:100]]}
     except Exception as e: metrics['agent_load']={'records':[],'error':str(e)}; metrics['recent_cases']={'records':[]}; errors.append('Agent workload: '+str(e))
     # Yesterday closing is surfaced as closed yesterday here; opening/closing backlog is not inferred from this count.
-    return jsonify(ok=True,metrics=metrics,errors=errors,notes=['Agent workload is based on the latest 2,000 cases returned by Salesforce.','Owner changes are a forwarding proxy; validate transfer rules and first-assigned-group attribution before using for official L1/L2 reporting.','Closed yesterday is not the same as yesterday end-of-day open backlog.'])
+    return jsonify(ok=True,metrics=metrics,errors=errors,notes=['Agent workload is based on the latest 2,000 cases returned by Salesforce.','New tickets today is filtered by First Assigned Group = ERP Helpdesk-L1 or ERP Helpdesk-L2; the field API name is resolved from the Case field label or FIRST_ASSIGNED_GROUP_FIELD.','Closed yesterday is not the same as yesterday end-of-day open backlog.'])
 
 
 @app.get('/diagnostics')
@@ -240,6 +266,73 @@ def diagnostics():
         checks=results,
         next_step='Compare these counts with the Salesforce report filters, date field, running user, and report time zone. Do not change official dashboard metrics until the report definition is matched.'
     )
+
+@app.get('/reports')
+@require_app_login
+def reports_route():
+    """List saved Salesforce reports visible to the connected user."""
+    if not current_sf(): return jsonify(ok=False,error='Connect Salesforce first.'),401
+    try:
+        data=sf_request('GET',f'/services/data/v{API_VERSION}/analytics/reports')
+        rows=[]
+        for r in (data if isinstance(data,list) else data.get('reports', [])):
+            rows.append({k:r.get(k) for k in ('id','name','format','folderName','ownerName','lastRunDate','namespace') if r.get(k) is not None})
+        rows.sort(key=lambda x: ((x.get('folderName') or '').lower(),(x.get('name') or '').lower()))
+        return jsonify(ok=True,reports=rows,count=len(rows),source='Salesforce Analytics Reports API')
+    except Exception as e:
+        return jsonify(ok=False,error='Could not list Salesforce reports. Confirm the connected user has report access and API access. '+str(e)),400
+
+@app.get('/reports/<report_id>/describe')
+@require_app_login
+def report_describe_route(report_id):
+    if not current_sf(): return jsonify(ok=False,error='Connect Salesforce first.'),401
+    if not re.fullmatch(r'[A-Za-z0-9]{15,18}', report_id or ''):
+        return jsonify(ok=False,error='Invalid Salesforce report ID.'),400
+    try:
+        data=sf_request('GET',f'/services/data/v{API_VERSION}/analytics/reports/{report_id}/describe')
+        md=data.get('reportMetadata',{})
+        ext=data.get('reportExtendedMetadata',{})
+        cols=ext.get('detailColumnInfo',{})
+        return jsonify(ok=True,report_id=report_id,name=md.get('name'),format=md.get('reportFormat'),detail_columns=[{'name':k,'label':(v or {}).get('label',k),'dataType':(v or {}).get('dataType')} for k,v in cols.items()],report_metadata=md)
+    except Exception as e:
+        return jsonify(ok=False,error='Could not describe this report. '+str(e)),400
+
+@app.post('/reports/<report_id>/run')
+@require_app_login
+def report_run_route(report_id):
+    """Execute a saved report using Salesforce's Reports API; read-only."""
+    if not current_sf(): return jsonify(ok=False,error='Connect Salesforce first.'),401
+    if not re.fullmatch(r'[A-Za-z0-9]{15,18}', report_id or ''):
+        return jsonify(ok=False,error='Invalid Salesforce report ID.'),400
+    body=request.get_json(silent=True) or {}
+    include_details=bool(body.get('includeDetails', True))
+    try:
+        result=sf_request('GET',f'/services/data/v{API_VERSION}/analytics/reports/{report_id}',params={'includeDetails':str(include_details).lower()})
+        md=result.get('reportMetadata',{})
+        ext=result.get('reportExtendedMetadata',{})
+        col_info=ext.get('detailColumnInfo',{})
+        col_names=md.get('detailColumns',[]) or list(col_info.keys())
+        columns=[{'name':n,'label':(col_info.get(n) or {}).get('label',n),'dataType':(col_info.get(n) or {}).get('dataType')} for n in col_names]
+        # Report API stores detail rows inside factMap. Flatten the detail section without inventing values.
+        records=[]
+        fact_map=result.get('factMap',{}) or {}
+        detail_facts = [fact_map['T!']] if 'T!' in fact_map else list(fact_map.values())
+        seen_rows = set()
+        for fact in detail_facts:
+            for row in (fact or {}).get('rows',[]) or []:
+                cells=row.get('dataCells',[]) or []
+                normalized={columns[i]['name'] if i < len(columns) else f'Column_{i+1}': (cell or {}).get('label', (cell or {}).get('value')) for i,cell in enumerate(cells)}
+                row_key=repr(normalized)
+                if row_key not in seen_rows:
+                    seen_rows.add(row_key); records.append(normalized)
+        report_fact={}
+        for key,fact in fact_map.items():
+            aggregates=(fact or {}).get('aggregates')
+            if aggregates:
+                report_fact[key]=[{'label':a.get('label'),'value':a.get('value')} for a in aggregates]
+        return jsonify(ok=True,report_id=report_id,name=md.get('name'),format=md.get('reportFormat'),columns=columns,records=records,record_count=len(records),fact_map=report_fact,report_metadata=md,has_detail_rows=bool(records),message=('Report executed; detail rows returned.' if records else 'Report executed, but no detail rows were returned. Check report format, filters, and whether detail rows are enabled. Summary totals are included when available.'))
+    except Exception as e:
+        return jsonify(ok=False,error='Salesforce could not run this report. Check report permissions, report type, and API access. '+str(e)),400
 
 @app.get('/objects')
 @require_app_login
