@@ -34,9 +34,12 @@ def soap_login(login_url, username, password, token):
     r.raise_for_status()
     sid = root.findtext('.//{urn:partner.soap.sforce.com}sessionId')
     server = root.findtext('.//{urn:partner.soap.sforce.com}serverUrl')
-    org = root.findtext('.//{urn:partner.soap.sforce.com}userInfo/{urn:partner.soap.sforce.com}organizationId')
+    userinfo = root.find('.//{urn:partner.soap.sforce.com}userInfo')
+    org = userinfo.findtext('{urn:partner.soap.sforce.com}organizationId') if userinfo is not None else None
+    sf_username = userinfo.findtext('{urn:partner.soap.sforce.com}userName') if userinfo is not None else None
+    user_id = userinfo.findtext('{urn:partner.soap.sforce.com}userId') if userinfo is not None else None
     if not sid or not server: raise RuntimeError('Salesforce login response did not contain a session.')
-    return sid, server, org
+    return sid, server, org, sf_username, user_id
 
 
 def current_sf():
@@ -47,7 +50,7 @@ def current_sf():
 
 def sf_request(method, path, params=None, json_body=None):
     sf = current_sf()
-    if not sf: raise RuntimeError('Connect Salesforce first.')
+    if not sf: raise RuntimeError('Salesforce is not connected in this server session. Connect again; a Render restart may clear in-memory sessions.')
     m = re.match(r'^(https?://[^/]+)', sf['server_url'])
     if not m: raise RuntimeError('Invalid Salesforce server URL.')
     url = m.group(1) + path if path.startswith('/') else path
@@ -114,20 +117,31 @@ def connect():
     if not all([url,username,password,token]): return jsonify(ok=False,error='Enter Salesforce URL, username, password and security token.'),400
     if not re.match(r'^https://[A-Za-z0-9.-]+(?::\d+)?$',url): return jsonify(ok=False,error='Enter a valid HTTPS Salesforce login URL.'),400
     try:
-        sid, server_url, org_id=soap_login(url,username,password,token)
+        sid, server_url, org_id, sf_username, sf_user_id = soap_login(url,username,password,token)
         key=session.get('sf_key') or secrets.token_urlsafe(32)
-        with LOCK: SF_SESSIONS[key]={'session_id':sid,'server_url':server_url,'org_id':org_id,'username':username,'created':time.time()}
+        # Replace any prior connection for this browser session only after SOAP login succeeds.
+        with LOCK:
+            SF_SESSIONS[key]={'session_id':sid,'server_url':server_url,'org_id':org_id,
+                              'username':sf_username or username,'user_id':sf_user_id,'created':time.time()}
         session['sf_key']=key
-        # Verify REST API access with a lightweight identity query.
-        identity=sf_request('GET',f'/services/data/v{API_VERSION}/limits')
-        return jsonify(ok=True,organization_id=org_id or 'Connected', api_version=API_VERSION, server_url=server_url, verified=True)
+        session.permanent=True
+        # Verify the actual REST API session and permissions with a lightweight request.
+        limits=sf_request('GET',f'/services/data/v{API_VERSION}/limits')
+        return jsonify(ok=True,organization_id=org_id or 'Connected',
+                       salesforce_username=sf_username or username, salesforce_user_id=sf_user_id,
+                       api_version=API_VERSION, verified=True,
+                       message='Salesforce login and REST API verification succeeded.')
     except Exception as e: return jsonify(ok=False,error=str(e)),400
 
 @app.get('/status')
 @require_app_login
 def status():
     sf=current_sf()
-    return jsonify(ok=True, app_user=session.get('app_user'), connected=bool(sf), organization_id=(sf or {}).get('org_id'), api_version=API_VERSION)
+    return jsonify(ok=True, app_user=session.get('app_user'), connected=bool(sf),
+                   organization_id=(sf or {}).get('org_id'),
+                   salesforce_username=(sf or {}).get('username'),
+                   connected_at=(sf or {}).get('created'),
+                   api_version=API_VERSION)
 
 @app.get('/dashboard')
 @require_app_login
