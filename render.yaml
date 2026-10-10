@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: salesforce-mis-cloud
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 8 --timeout 120 app:app
+    healthCheckPath: /health
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: APP_USERNAME
+        value: team
+      - key: APP_PASSWORD
+        sync: false
+      - key: SALESFORCE_API_VERSION
+        value: "65.0"
+      - key: COOKIE_SECURE
+        value: "true"
