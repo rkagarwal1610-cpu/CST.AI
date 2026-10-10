@@ -65,7 +65,26 @@ def sf_request(method, path, params=None, json_body=None):
     return r.json() if r.content else {}
 
 
-def query(soql): return sf_request('GET', f'/services/data/v{API_VERSION}/query', {'q':soql})
+def query(soql, max_records=50000):
+    """Run read-only SOQL and follow Salesforce queryMore pages.
+
+    Salesforce REST queries can return multiple pages. This helper combines them
+    so dashboard counts and record-based calculations are not silently limited to
+    the first response page. max_records is a safety cap for interactive use.
+    """
+    result = sf_request('GET', f'/services/data/v{API_VERSION}/query', {'q': soql})
+    records = list(result.get('records', []) or [])
+    done = bool(result.get('done', True))
+    while not done and result.get('nextRecordsUrl') and len(records) < max_records:
+        page = sf_request('GET', result['nextRecordsUrl'])
+        records.extend(page.get('records', []) or [])
+        done = bool(page.get('done', True))
+        result = page
+    # For aggregate COUNT() responses there are no row pages; totalSize is the count.
+    result['records'] = records[:max_records]
+    result['recordsFetched'] = len(result['records'])
+    result['paginationComplete'] = done or len(records) >= max_records
+    return result
 def describe(obj):
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', obj or ''): raise RuntimeError('Invalid Salesforce object name.')
     return sf_request('GET', f'/services/data/v{API_VERSION}/sobjects/{obj}/describe')
@@ -186,21 +205,61 @@ def dashboard():
                 soql = f"SELECT COUNT() FROM Case WHERE CreatedDate = TODAY AND {group_field} IN ({group_values})"
             data=query(soql); metrics[key]={'label':label,'value':data.get('totalSize',0)}
         except Exception as e: metrics[key]={'label':label,'value':None,'error':str(e)}; errors.append(label+': '+str(e))
-    # Agent load is calculated client-side from returned case records to avoid unsupported aggregate CASE logic.
+    # Agent workload uses a Salesforce aggregate across the full visible Case set,
+    # rather than pretending the latest 2,000 records represent all cases.
     try:
-        data=query("SELECT Id, CaseNumber, Subject, Status, IsClosed, OwnerId, Owner.Name, CreatedDate, ClosedDate, Priority, Account.Name, Type, Origin, Reason, LastModifiedDate FROM Case ORDER BY CreatedDate DESC LIMIT 2000")
-        records=data.get('records',[]); agents={}
-        for c in records:
-            owner=(c.get('Owner') or {}).get('Name') or 'Unassigned'
-            a=agents.setdefault(owner,{'agent':owner,'total_in_sample':0,'open_in_sample':0,'closed_in_sample':0})
-            a['total_in_sample']+=1
-            if c.get('IsClosed'): a['closed_in_sample']+=1
-            else: a['open_in_sample']+=1
-        metrics['agent_load']={'label':'Agent workload (latest 2,000 cases)','records':sorted(agents.values(),key=lambda x:x['open_in_sample'],reverse=True)}
-        metrics['recent_cases']={'records':[{k:v for k,v in c.items() if k!='attributes'} for c in records[:100]]}
-    except Exception as e: metrics['agent_load']={'records':[],'error':str(e)}; metrics['recent_cases']={'records':[]}; errors.append('Agent workload: '+str(e))
+        grouped = query(
+            "SELECT OwnerId, IsClosed, COUNT(Id) caseCount "
+            "FROM Case GROUP BY OwnerId, IsClosed"
+        )
+        owner_ids = list(dict.fromkeys(
+            row.get('OwnerId') for row in grouped.get('records', []) if row.get('OwnerId')
+        ))
+        owner_names = {}
+        for prefix, obj in (('005', 'User'), ('00G', 'Group')):
+            ids = [oid for oid in owner_ids if oid.startswith(prefix)]
+            for offset in range(0, len(ids), 100):
+                batch = ids[offset:offset + 100]
+                if not batch:
+                    continue
+                literals = ','.join("'" + x.replace("'", "\\'") + "'" for x in batch)
+                try:
+                    owner_result = query(f"SELECT Id, Name FROM {obj} WHERE Id IN ({literals})")
+                    owner_names.update({r.get('Id'): r.get('Name') for r in owner_result.get('records', [])})
+                except Exception:
+                    # Continue with IDs if this owner type is not accessible.
+                    pass
+        agents = {}
+        for row in grouped.get('records', []):
+            owner_id = row.get('OwnerId')
+            owner = owner_names.get(owner_id) or owner_id or 'Unassigned'
+            closed = bool(row.get('IsClosed'))
+            item = agents.setdefault(owner, {
+                'agent': owner, 'total_cases': 0, 'open_cases': 0, 'closed_cases': 0
+            })
+            count = int(row.get('caseCount') or 0)
+            item['total_cases'] += count
+            if closed:
+                item['closed_cases'] += count
+            else:
+                item['open_cases'] += count
+        metrics['agent_load'] = {
+            'label': 'Current case workload (all visible cases)',
+            'records': sorted(agents.values(), key=lambda x: x['open_cases'], reverse=True),
+            'source': 'SOQL aggregate'
+        }
+        recent = query(
+            "SELECT Id, CaseNumber, Subject, Status, IsClosed, OwnerId, Owner.Name, "
+            "CreatedDate, ClosedDate, Priority, Account.Name, Type, Origin, Reason, "
+            "LastModifiedDate FROM Case ORDER BY CreatedDate DESC LIMIT 100"
+        )
+        metrics['recent_cases'] = {'records': recent.get('records', [])}
+    except Exception as e:
+        metrics['agent_load'] = {'records': [], 'error': str(e)}
+        metrics['recent_cases'] = {'records': []}
+        errors.append('Agent workload: ' + str(e))
     # Yesterday closing is surfaced as closed yesterday here; opening/closing backlog is not inferred from this count.
-    return jsonify(ok=True,metrics=metrics,errors=errors,notes=['Agent workload is based on the latest 2,000 cases returned by Salesforce.','New tickets today is filtered by First Assigned Group = ERP Helpdesk-L1 or ERP Helpdesk-L2; the field API name is resolved from the Case field label or FIRST_ASSIGNED_GROUP_FIELD.','Closed yesterday is not the same as yesterday end-of-day open backlog.'])
+    return jsonify(ok=True,metrics=metrics,errors=errors,notes=['Agent workload counts are grouped across all Case records visible to the connected Salesforce user; they describe current ownership, not historical processed-ticket attribution.','New tickets today is filtered by First Assigned Group = ERP Helpdesk-L1 or ERP Helpdesk-L2; the field API name is resolved from the Case field label or FIRST_ASSIGNED_GROUP_FIELD.','Closed yesterday is not the same as yesterday end-of-day open backlog.'])
 
 
 @app.get('/diagnostics')
@@ -333,6 +392,76 @@ def report_run_route(report_id):
         return jsonify(ok=True,report_id=report_id,name=md.get('name'),format=md.get('reportFormat'),columns=columns,records=records,record_count=len(records),fact_map=report_fact,report_metadata=md,has_detail_rows=bool(records),message=('Report executed; detail rows returned.' if records else 'Report executed, but no detail rows were returned. Check report format, filters, and whether detail rows are enabled. Summary totals are included when available.'))
     except Exception as e:
         return jsonify(ok=False,error='Salesforce could not run this report. Check report permissions, report type, and API access. '+str(e)),400
+
+@app.get('/schema/required')
+@require_app_login
+def required_schema():
+    """Inspect the actual live Salesforce API schema for the MIS source objects.
+
+    Report-type labels are not assumed to be queryable object names. The response
+    explicitly separates objects available in this org from missing/non-queryable
+    sources and maps useful Case fields by label.
+    """
+    if not current_sf():
+        return jsonify(ok=False, error='Connect Salesforce first.'), 401
+    object_catalogue = sf_request('GET', f'/services/data/v{API_VERSION}/sobjects')
+    by_name = {o.get('name'): o for o in object_catalogue.get('sobjects', [])}
+    candidates = [
+        ('Case', ['Case']),
+        ('CaseHistory', ['Case History']),
+        ('CaseMilestone', ['Case Milestone']),
+        ('Case_Aging__c', ['Case Aging', 'Case Agings']),
+        ('Feedback__c', ['Feedback']),
+        ('Time_Log__c', ['Time Log', 'Time Logs']),
+        ('Account', ['Account']),
+    ]
+    sources = []
+    for api_name, labels in candidates:
+        obj = by_name.get(api_name)
+        item = {
+            'api_name': api_name,
+            'expected_labels': labels,
+            'available': bool(obj),
+            'label': (obj or {}).get('label'),
+            'queryable': bool((obj or {}).get('queryable')),
+            'custom': bool((obj or {}).get('custom')),
+            'fields': [],
+            'error': None
+        }
+        if obj and obj.get('queryable'):
+            try:
+                desc = describe(api_name)
+                item['fields'] = [
+                    {'name': f.get('name'), 'label': f.get('label'),
+                     'type': f.get('type'), 'filterable': f.get('filterable'),
+                     'referenceTo': f.get('referenceTo') or [],
+                     'relationshipName': f.get('relationshipName')}
+                    for f in desc.get('fields', [])
+                ]
+            except Exception as exc:
+                item['error'] = str(exc)
+        sources.append(item)
+
+    case_fields = []
+    if by_name.get('Case'):
+        try:
+            desc = describe('Case')
+            wanted = ('first assigned group', 'priority', 'type', 'status', 'application',
+                      'application module', 'owner', 'created date', 'closed date',
+                      'resolved date', 'account')
+            for f in desc.get('fields', []):
+                label = (f.get('label') or '').strip().casefold()
+                if any(term in label for term in wanted):
+                    case_fields.append({
+                        'name': f.get('name'), 'label': f.get('label'),
+                        'type': f.get('type'), 'filterable': f.get('filterable'),
+                        'referenceTo': f.get('referenceTo') or [],
+                        'relationshipName': f.get('relationshipName')
+                    })
+        except Exception:
+            pass
+    return jsonify(ok=True, sources=sources, case_field_candidates=case_fields,
+                   note='Joined Salesforce report types such as “Case Agings with Case” may not be direct API objects. Use the returned API names and relationships; do not infer custom object names from report labels.')
 
 @app.get('/objects')
 @require_app_login
